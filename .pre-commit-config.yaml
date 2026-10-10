@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier
+        entry: bun x --no-install prettier --write
+        language: system
+        files: \.(ts|js|json|jsonc|yaml|yml|md|css)$
+        exclude: ^(worker-configuration\.d\.ts|bun\.lock|public/assets/client\.js)
+      - id: typecheck
+        name: strict TypeScript
+        entry: bun run typecheck
+        language: system
+        pass_filenames: false
+        files: \.(ts|json|jsonc)$

@@ -1,314 +1,75 @@
-# FileDrop — Deployment Guide
+# Deploying FileDrop
 
-Everything you need to get FileDrop running on Cloudflare's free tier.
+Use a dedicated R2 bucket and D1 database. This fork does not migrate an existing upstream KV deployment. Cloudflare storage, operations, Workers, D1 and Access usage remain subject to the account's plan and billing; large file transfers are not promised to be free.
 
----
+## Install and configure
 
-## What you'll need
-
-- A **Cloudflare account** (free) — [dash.cloudflare.com](https://dash.cloudflare.com)
-- **Node.js** installed locally (any recent LTS version) — only needed to run `wrangler`
-- **~20 minutes**
-
-> A custom domain is **optional**. FileDrop works out of the box on the free
-> `*.workers.dev` URL. If you do want a custom domain, you'll need it added to Cloudflare
-> DNS — see the note in Step 5b.
-
----
-
-## Step 1 — Install Wrangler
-
-```bash
-npm install -g wrangler
+```sh
+bun install --frozen-lockfile
+bun x wrangler login
+cp wrangler.jsonc wrangler.deploy.jsonc
+bun x wrangler r2 bucket create sensmore-filedrop --location weur
+bun x wrangler d1 create sensmore-filedrop --location weur
 ```
 
-Authenticate with your Cloudflare account:
+Set `account_id` and the returned `database_id` in the ignored `wrangler.deploy.jsonc`. Set the Worker name, bucket/database names, Access team domain and allowed email domain for your account. The Worker name `files` in the `sensmore` Workers account gives `files.sensmore.workers.dev`. Keep preview URLs disabled and the R2 bucket private.
 
-```bash
-wrangler login
+Apply the database schema and storage lifecycle:
+
+```sh
+bun x wrangler d1 migrations apply sensmore-filedrop --remote --config wrangler.deploy.jsonc
+bun x wrangler r2 bucket lifecycle set sensmore-filedrop --file r2-lifecycle.json --force
 ```
 
-This opens a browser window. Log in and grant access. When you see "Successfully logged in" in the terminal, continue.
+The lifecycle command replaces rules on this dedicated bucket: completed objects under `transfers/` expire after 30 days; incomplete multipart uploads abort after 7 days. The hourly Worker job additionally applies each transfer's earlier expiration or deactivation.
 
----
+## Staff authentication
 
-## Step 2 — Create the R2 bucket
+In Cloudflare Zero Trust, create a **self-hosted Access application**:
 
-```bash
-wrangler r2 bucket create filedrop-files
+- Domain/path: `files.sensmore.workers.dev/admin` (the `/admin` path and its descendants only).
+- Session: 24 hours.
+- Allow policy: **Emails ending in** `sensmore.ai`.
+- Login method for now: **One-time PIN** (email codes).
+- Do not add Everyone/Bypass policies or protect the whole hostname: customers need the public transfer paths.
+
+Copy the application's **AUD tag** into `vars.ACCESS_AUD` in `wrangler.deploy.jsonc`. Set `ACCESS_TEAM_DOMAIN` to `sensmore.cloudflareaccess.com` and `ALLOWED_EMAIL_DOMAIN` to `sensmore.ai`.
+
+The Worker verifies the Access JWT itself, including audience and issuer. An empty audience disables staff access. An email header by itself is never sufficient.
+
+### Adding Google later
+
+Create an internal Google Workspace OAuth app and add it as a Google identity provider in Cloudflare Zero Trust. Use the redirect URL shown by Cloudflare. Enable that provider for **FileDrop staff**, keeping the `sensmore.ai` allow policy and the same Access application/AUD. Remove the One-time PIN method from this application if Google should be the only login method. No Worker code or shared custom authentication service is needed. Other apps can use the same identity provider with their own Access applications and policies.
+
+## Validate and publish
+
+```sh
+bun run types
+bun run build
+bun run typecheck
+bun run test
+pre-commit run --all-files
+bun x wrangler deploy --config wrangler.deploy.jsonc
 ```
 
-You should see: `Created bucket 'filedrop-files'`
-
----
-
-## Step 3 — Create the KV namespace
-
-```bash
-wrangler kv namespace create FILEDROP_KV
-```
-
-The output will look like this:
-
-```
-Add the following to your configuration file in your kv_namespaces array:
-{ binding = "FILEDROP_KV", id = "abc123def456..." }
-```
-
-**Copy that `id` value.** Open `wrangler.toml` and replace `REPLACE_WITH_YOUR_KV_NAMESPACE_ID` with it:
-
-```toml
-[[kv_namespaces]]
-binding = "FILEDROP_KV"
-id = "abc123def456..."   # ← paste your actual ID here
-```
-
----
-
-## Step 4 — Deploy the Worker
-
-```bash
-wrangler deploy
-```
-
-Expected output:
-```
-Uploaded filedrop (X.XX sec)
-Published filedrop (X.XX sec)
-  https://filedrop.YOUR-SUBDOMAIN.workers.dev
-```
-
-Your app is now live at that URL. **But do not share it yet** — set up Access first (next step) or it's publicly accessible to anyone.
-
----
-
-## Step 5 — Set up Cloudflare Access (email OTP gate)
-
-This is the authentication layer. It sits in front of your Worker and handles the email OTP login. Only email addresses you whitelist can reach the dashboard and generate links.
-
-### 5a. Open Zero Trust dashboard
-
-Go to [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → your account → **Zero Trust**.
-
-If this is your first time, you'll be asked to choose a team name (e.g. `mycompany` or anything you like). This becomes part of the login portal URL.
-
-### 5b. Create a new Access Application
-
-Navigate to: **Access → Applications → Add an application**
-
-Select **"Self-hosted"**.
-
-Fill in:
-
-| Field | Value |
-|---|---|
-| **Application name** | `FileDrop` |
-| **Session duration** | `24 hours` (or your preference) |
-| **Application domain** | Your Worker URL, e.g. `filedrop.yourname.workers.dev` |
-
-> **Using a custom domain?** Set the Application domain to `filedrop.yourdomain.com`,
-> uncomment the `routes` block in `wrangler.toml` (and set `workers_dev = false` if you
-> want to disable the workers.dev URL), then add a DNS CNAME record:
-> `filedrop` → `filedrop.yourname.workers.dev` in your Cloudflare DNS settings.
-
-Click **Next**.
-
-### 5c. Add an Allow Policy for authenticated users
-
-Click **Add a policy**.
-
-| Field | Value |
-|---|---|
-| **Policy name** | `Allowed Users` |
-| **Action** | `Allow` |
-
-Under **Configure rules**, add a rule:
-
-| Selector | Value |
-|---|---|
-| `Emails` | `alice@example.com, bob@example.com` (one per line — your user list) |
-
-Click **Save policy**, then **Save application**.
-
-### 5d. Add Bypass Policies for public paths ⚠️ Required
-
-> **This step is critical.** Without it, recipients who open a transfer link will hit the Access login wall and cannot upload or download files — even though the link is meant to be public.
-
-Cloudflare Access intercepts all requests at the network edge, before the Worker runs. The three public endpoints must be explicitly bypassed so unauthenticated recipients can use them.
-
-Still in **Access → Applications → FileDrop → Edit**, go to the **Policies** tab and add **three separate Bypass policies** — one for each public path:
-
-**Policy 1 — Transfer page**
-
-| Field | Value |
-|---|---|
-| **Policy name** | `Public — Transfer page` |
-| **Action** | `Bypass` |
-| **Path** | `/t/*` |
-
-Under **Configure rules**: Selector = `Everyone`
-
-**Policy 2 — File upload**
-
-| Field | Value |
-|---|---|
-| **Policy name** | `Public — Upload` |
-| **Action** | `Bypass` |
-| **Path** | `/upload/*` |
-
-Under **Configure rules**: Selector = `Everyone`
-
-**Policy 3 — File download**
-
-| Field | Value |
-|---|---|
-| **Policy name** | `Public — Download` |
-| **Action** | `Bypass` |
-| **Path** | `/download/*` |
-
-Under **Configure rules**: Selector = `Everyone`
-
-Save each policy. Your policy list should now show the Bypass policies above the Allow policy.
-
-> **Important:** Do **not** add a bypass for `/` or `/deactivate/*`. Those remain protected — only logged-in users can access the dashboard and deactivate links.
-
-### 5e. Verify it works
-
-Visit your Worker URL in a fresh private/incognito browser window. You should see the Cloudflare Access login page — **not** your FileDrop app directly.
-
-Enter one of the allowed email addresses. Check the inbox for a 6-digit code. Enter it. You should land on the FileDrop dashboard.
-
----
-
-## Step 6 — Test the full flow
-
-1. **Log in** at your Worker URL with an allowed email address
-2. Click **"Generate Link"** — a transfer link appears and can be copied to your clipboard
-3. **Open the link** in a different browser or machine (no login needed — the bypass policies handle this)
-4. **Drop a file** onto the upload zone and click "Upload Files" — a per-file progress indicator is shown
-5. Go back to the dashboard — the file count on the link card should update
-6. Open the transfer link again — the file should appear with a download button
-7. Click **↓** to download it
-8. Back on the dashboard, click **"Deactivate"** to kill the link early — files are removed by the hourly cleanup cron
-
----
-
-## Managing users
-
-To **add or remove users**, go to:
-
-**Zero Trust → Access → Applications → FileDrop → Edit → Policies → Allowed Users → Edit**
-
-Update the email list and save. Changes take effect immediately — no redeployment needed.
-
----
-
-## Managing files & links (emergency / admin)
-
-You don't need a separate admin panel. Use the Cloudflare dashboards directly:
-
-| Task | Where |
-|---|---|
-| Browse or delete stored files | Cloudflare Dashboard → R2 → `filedrop-files` → Browse |
-| Inspect or delete link metadata | Cloudflare Dashboard → Workers & Pages → KV → `FILEDROP_KV` → View |
-| View Worker errors in real time | Workers & Pages → `filedrop` → Logs → Begin log stream |
-| View Access login history | Zero Trust → Access → Logs |
-
----
-
-## Route reference
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/` | Required | Dashboard |
-| `POST` | `/generate` | Required | Create a new transfer link |
-| `POST` | `/deactivate/:token` | Required | Deactivate a link (owner only) |
-| `GET` | `/t/:token` | Bypassed | Transfer page (public) |
-| `POST` | `/upload/:token` | Bypassed | Upload a file to a link (public) |
-| `GET` | `/download/:token/:filename` | Bypassed | Download a file (public) |
-
-Files are uploaded one at a time as a raw binary stream — no multipart encoding. This allows the Worker to pipe bytes directly to R2 without buffering the entire file in memory.
-
-Deactivated links have their R2 files removed by the **hourly cleanup cron**. Files from expired links are also removed at that time.
-
----
-
-## Updating the Worker
-
-After any code change to `worker.js` or `wrangler.toml`:
-
-```bash
-wrangler deploy
-```
-
-That's it — zero downtime.
-
----
-
-## Local development (optional)
-
-To run FileDrop locally before deploying:
-
-```bash
-wrangler dev
-```
-
-This starts a local server at `http://localhost:8787`.
-
-> **Note:** Cloudflare Access does **not** run locally. The Worker checks for the `Cf-Access-Authenticated-User-Email` header — which won't be present in local dev. To test locally, temporarily uncomment the fallback line in `worker.js`:
->
-> ```js
-> // Find this line in handleRequest():
-> const userEmail = request.headers.get("Cf-Access-Authenticated-User-Email") || "dev@localhost";
-> ```
->
-> **Remember to remove the fallback before deploying to production.**
-
----
-
-## Troubleshooting
-
-**Transfer link asks recipients to log in**
-→ The Cloudflare Access bypass policies for `/t/*`, `/upload/*`, and `/download/*` are missing or not saved. See Step 5d. All three paths need a Bypass policy with action = Everyone.
-
-**Upload fails with "Network error" immediately**
-→ The `/upload/*` bypass policy is missing. Cloudflare Access is intercepting the upload request before it reaches the Worker. Add the bypass policy as described in Step 5d.
-
-**Deactivate button fails with 401**
-→ A bypass policy is incorrectly covering `/t/*` for all HTTP methods and stripping the auth header from the deactivate request. The deactivate endpoint is `POST /deactivate/:token` — ensure your bypass policy is scoped to `/t/*` (GET only, not all methods). The Worker routes deactivation through `/deactivate/` specifically to avoid this conflict.
-
-**"Unauthorized — Cloudflare Access required" when visiting the app**
-→ Cloudflare Access is not in front of the Worker. Check the Access application domain matches your Worker URL exactly.
-
-**Upload fails with "Link has expired" immediately after generating**
-→ Check that your KV namespace ID in `wrangler.toml` is correct and the namespace exists (`wrangler kv namespace list`).
-
-**Files don't appear after upload**
-→ KV has eventual consistency — wait a few seconds and refresh the transfer page.
-
-**"Internal server error" on any request**
-→ Check Worker logs: `wrangler tail` in your terminal while reproducing the error. This streams live logs.
-
-**Files still visible in R2 after deactivating a link**
-→ Expected behaviour. R2 cleanup runs on the hourly cron — files will be deleted within the hour. The link itself is immediately deactivated so recipients can no longer access it.
-
-**Access login emails going to spam**
-→ The OTP email comes from Cloudflare's own sending infrastructure. Check spam/junk and mark as not spam. Nothing to configure on your end.
-
-**Want to change the 4-hour link expiry?**
-→ Edit `LINK_TTL_SECONDS` in `worker.js` then `wrangler deploy`.
-
----
-
-## Free tier limits — at a glance
-
-| Limit | Free allowance | Expected usage |
-|---|---|---|
-| Workers requests | 100,000 / day | < 50 per transfer session |
-| R2 storage | 10 GB (turns over every 4h) | Depends on file sizes |
-| R2 operations | 1M writes, 10M reads / month | Negligible for personal use |
-| KV reads/writes | 100,000 / day | < 10 per session |
-| Access users | 50 | Your team size |
-| Egress / bandwidth | **Unlimited / free** | — |
-
-All of the above = **$0.00/month** for typical personal/small-team use.
+The committed `wrangler.jsonc` is the portable local/test template. Always pass `--config wrangler.deploy.jsonc` for this deployment; it contains the actual D1 ID and Access AUD.
+
+Check the deployment:
+
+1. `/` loads without authentication and accepts grouped or ungrouped transfer codes.
+2. `/admin` redirects an anonymous browser to Access; only a `@sensmore.ai` user can sign in.
+3. Create a transfer, open it in a separate unauthenticated browser, upload a file, then download and compare its bytes.
+4. Pause a multipart upload and select the same file again: previously completed parts should be retained.
+5. Deactivate the transfer from its owner's dashboard; public access stops immediately.
+6. Check the hourly scheduled execution and R2 lifecycle rules. Check storage usage and failed cleanup events if physical deletion falls behind.
+
+Unit/integration tests exercise local R2/D1 and signed test JWTs; they do not prove a production Google/OTP login or a complete 100 GB transfer. No authentication bypass should be added for local development or smoke tests.
+
+## Operations
+
+- Change allowed staff or login providers in the FileDrop Access application.
+- D1 contains transfer/file/part metadata; R2 contains the bytes. Do not delete metadata alone when removing files: the cleanup job needs it to locate objects.
+- Revoking a link immediately blocks new requests; running downloads may finish.
+- Re-deploy with the same ignored config after building and checks.
+- Keep the lifecycle policy in place as a backstop for orphaned objects and unfinished uploads.
+- Failures log event types/counts without URLs, codes or file names. Avoid recording live transfer URLs in screenshots, support tickets or Worker tails.

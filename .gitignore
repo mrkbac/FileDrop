@@ -11,6 +11,10 @@
 
 # Node
 node_modules/
+public/assets/client.js
+worker-configuration.d.ts
+wrangler.deploy.jsonc
+test-artifacts/
 npm-debug.log*
 yarn-error.log
 

@@ -1,0 +1,15 @@
+{
+  "rules": [
+    {
+      "id": "FileDrop temporary files",
+      "enabled": true,
+      "conditions": { "prefix": "transfers/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 2592000 }
+      },
+      "abortMultipartUploadsTransition": {
+        "condition": { "type": "Age", "maxAge": 604800 }
+      }
+    }
+  ]
+}
